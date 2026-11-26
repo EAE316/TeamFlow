@@ -4,7 +4,8 @@ Windows desktop task manager with a Hebrew interface and Excel workbook storage.
 
 ## Download
 Get the installer EXE from [Releases](../../releases).
-Version 1.1.0 is an **untested preview**, not a production-validated release.
+Version 1.2.0 is a **preview**: its SharePoint fixes have only been tested with a simulated
+Excel, not real SharePoint. The previous 1.1.0 preview stays available on the same page.
 The installer is unsigned and Windows may display an unknown-publisher warning.
 
 ## SharePoint preview
@@ -26,4 +27,5 @@ Windows, Python 3.12, and Inno Setup 6 are required.
 
 This source distribution does not include private workbooks, local configuration,
 certificates, logs, backups, or the previous private test fixtures. Use -SkipTests.
-No runtime or SharePoint tests were run for the preview release.
+Local-file tests were run before release from the private fixtures. No real SharePoint
+tests were run for 1.2.0.

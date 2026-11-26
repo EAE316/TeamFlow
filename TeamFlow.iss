@@ -1,7 +1,7 @@
 ﻿; Inno Setup Script for TeamFlow - ניהול משימות צוות
 #define MyAppName "TeamFlow"
 #define MyAppHebrewName "ניהול משימות צוות"
-#define MyAppVersion "1.1.0"
+#define MyAppVersion "1.2.0"
 #define MyAppPublisher "Ibrahim Abd-Elnabi"
 #define MyAppExeName "TeamTaskManagerWeb.exe"
 
@@ -14,11 +14,11 @@ AppComments=ניהול משימות צוות מתקדם בסנכרון Excel
 AppCopyright=Copyright © 2026 Ibrahim Abd-Elnabi
 VersionInfoCompany={#MyAppPublisher}
 VersionInfoDescription={#MyAppName} - {#MyAppHebrewName}
-VersionInfoVersion=1.1.0.0
-VersionInfoTextVersion=1.1.0
+VersionInfoVersion=1.2.0.0
+VersionInfoTextVersion=1.2.0
 VersionInfoOriginalFileName=TeamFlow_Setup.exe
 VersionInfoProductName={#MyAppName}
-VersionInfoProductVersion=1.1.0.0
+VersionInfoProductVersion=1.2.0.0
 VersionInfoCopyright=Copyright © 2026 Ibrahim Abd-Elnabi
 DefaultDirName={autopf}\TeamFlow
 UsePreviousAppDir=yes

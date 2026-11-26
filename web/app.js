@@ -2914,6 +2914,7 @@ function updateConnection(info) {
   el.dataset.state = info.state || 'ready';
   q('#connectionLabel').textContent = info.state === 'connecting' ? 'מתחבר דרך Excel…'
     : info.state === 'error' ? 'החיבור דורש טיפול'
+    : info.busy ? 'Excel עסוק · ממתין'
     : isCloud ? 'מחובר ל-Excel · AutoSave פעיל' : 'עבודה מקומית';
   q('#connectionDetail').textContent = isCloud
     ? (info.lastReadAt ? 'קריאה אחרונה מ-Excel: ' + new Date(info.lastReadAt).toLocaleTimeString('he-IL') : info.message || '')
@@ -2932,7 +2933,13 @@ async function pollConnection() {
     const info = await api('/api/connection');
     updateConnection(info);
     const feedback = q('#cloudConnectFeedback');
-    if (info.mode === 'excel') {
+    if (info.attempt) {
+      // The new connection failed; the previous data source is still in use.
+      feedback.textContent = info.attempt.message || '';
+      feedback.dataset.state = 'error';
+      cloudConnectPending = false;
+      q('#btnConnectCloud').disabled = false;
+    } else if (info.mode === 'excel') {
       feedback.textContent = info.message || '';
       feedback.dataset.state = info.state;
       if (info.state === 'error') {

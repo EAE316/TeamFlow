@@ -7,6 +7,7 @@ No local-file writes, browser cookies, Graph credentials, or cloud-sync claims.
 import copy
 import hashlib
 import json
+import logging
 import queue
 import threading
 import time
@@ -17,6 +18,10 @@ from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit, parse_qs, unquote, quote
 
 MAX_ROWS = 15000
+# Unrecognised read errors are retried for this long before the connection is dropped.
+RETRY_SECONDS = 60
+# RPC_E_CALL_REJECTED, RPC_E_SERVERCALL_RETRYLATER, VBA_E_IGNORE: Excel is editing or showing a dialog.
+BUSY_CODES = {-2147418111, -2147417846, -2146777998}
 FIELDS = ('title', 'owner', 'priority', 'status', 'category', 'dueDate',
           'progress', 'blocked', 'notes', 'startDate', 'completedDate', 'id',
           'daysLeft', 'health', 'dueMonth', 'createdBy', 'createdAt',
@@ -30,6 +35,13 @@ class CloudError(Exception):
 
 class CloudConflict(CloudError):
     pass
+
+
+def is_busy(exc):
+    codes = [getattr(exc, 'hresult', None)] + list(exc.args[:1])
+    if len(exc.args) > 2 and isinstance(exc.args[2], (tuple, list)) and exc.args[2]:
+        codes.append(exc.args[2][-1])
+    return any(isinstance(code, int) and code in BUSY_CODES for code in codes)
 
 
 def normalize_url(value):
@@ -105,6 +117,10 @@ class ExcelConnection:
         self._queue = queue.Queue()
         self._stop = threading.Event()
         self._data = None
+        self._sheets = set()
+        self._failing_since = None
+        self._writing = False
+        self._last_read = 0
         self._state = dict(mode='excel', state='connecting', url=self.url,
                            message='Excel מתחבר לקובץ. אם מופיע חלון Microsoft, יש להשלים כניסה.',
                            cloudConfirmed=False, lastReadAt=None, autosave=False)
@@ -172,18 +188,22 @@ class ExcelConnection:
             self._read()
             if self.on_ready:
                 self.on_ready(self)
-            excel.WindowState = -4140  # Minimize only our dedicated Excel instance.
+            try:
+                excel.WindowState = -4140  # Minimize only our dedicated Excel instance.
+            except Exception:
+                logging.warning('Could not minimize Excel', exc_info=True)
             while not self._stop.is_set() or not self._queue.empty():
                 pythoncom.PumpWaitingMessages()
                 try:
                     future, operation, args = self._queue.get(timeout=0.15)
                 except queue.Empty:
                     if time.monotonic() - self._last_read >= 2:
-                        self._read()
+                        self._refresh()
                     continue
                 if not future.set_running_or_notify_cancel():
                     continue
                 try:
+                    self._writing = False
                     if operation == 'show':
                         excel.Visible = True
                         excel.WindowState = -4143
@@ -198,14 +218,21 @@ class ExcelConnection:
                     self._status(writePending=False)
                     future.set_exception(exc)
                 except Exception as exc:
+                    if not self._writing and not isinstance(exc, CloudError):
+                        # Nothing was written, so keep the connection; the refresh will judge it.
+                        logging.warning('Excel operation failed before writing', exc_info=True)
+                        self._status(writePending=False)
+                        future.set_exception(CloudError('Excel עסוק ולא בוצעו שינויים. סיים את העריכה או סגור את החלון ב-Excel ונסה שוב.'))
+                        continue
                     future.set_exception(exc)
                     raise
         except Exception as exc:
             message = str(exc)
             if not isinstance(exc, (CloudError, ValueError)):
                 message = 'לא ניתן להמשיך בחיבור ל-Excel. בדוק את חלון Excel, הכניסה לחשבון ו-AutoSave. הפרטים נשמרו ביומן.'
-                import logging
                 logging.exception('Excel connection failed')
+            else:
+                logging.error('Excel connection stopped: %s', exc)
             self._status(state='error', message=message)
         finally:
             while True:
@@ -226,6 +253,24 @@ class ExcelConnection:
             if pythoncom is not None:
                 pythoncom.CoUninitialize()
 
+    def _refresh(self):
+        """Background read that tolerates Excel being temporarily unavailable."""
+        try:
+            self._read()
+        except CloudError:
+            raise  # Read-only, AutoSave off, bad template: retrying cannot help.
+        except Exception as exc:
+            now = time.monotonic()
+            if self._failing_since is None:
+                self._failing_since = now
+                logging.warning('Excel read failed; retrying', exc_info=True)
+            if is_busy(exc):
+                self._failing_since = now  # A busy Excel never counts toward the limit.
+            elif now - self._failing_since >= RETRY_SECONDS:
+                raise
+            self._last_read = now
+            self._status(busy=True, message='Excel עסוק כרגע. החיבור נשמר וינסה שוב אוטומטית.')
+
     def _read(self):
         workbook = self.workbook
         if workbook.ReadOnly or not workbook.AutoSaveOn:
@@ -235,7 +280,10 @@ class ExcelConnection:
         for name, columns in ((task_sheet, 20), (self.schema['lists'], 10), (self.schema['history'], 6)):
             try:
                 sheet = workbook.Worksheets(name)
-            except Exception:
+            except Exception as exc:
+                # A sheet that was there before is unavailable, not missing.
+                if name in self._sheets or is_busy(exc):
+                    raise
                 if name == task_sheet:
                     raise CloudError('חסר גיליון משימות בתבנית TeamFlow.')
                 continue
@@ -276,12 +324,15 @@ class ExcelConnection:
         self._last_read = time.monotonic()
         with self._lock:
             self._data = data
-            self._state.update(state='ready', autosave=True,
+            self._sheets = set(sheets)
+            self._failing_since = None
+            self._state.update(state='ready', autosave=True, busy=False,
                                lastReadAt=datetime.now().isoformat(timespec='seconds'),
                                message='מחובר ל-Excel • AutoSave פעיל. אישור העלאה ל-SharePoint זמין ב-Excel.')
         return data
 
     def _update(self, task, expected_revision, history):
+        self._writing = False
         data = self._read()
         existing = next((t for t in data['tasks'] if t['id'] == task['id']), None)
         if not existing or existing['taskRevision'] != expected_revision:
@@ -334,6 +385,7 @@ class ExcelConnection:
         recovery = dict(url=self.url, task=task, previous=existing,
                         status='pending-in-excel', time=datetime.now().isoformat())
         journal.write_text(json.dumps(recovery, ensure_ascii=False, indent=2), encoding='utf-8')
+        self._writing = True
         for col, val in patches:
             cell = sheet.Cells(row, col)
             if isinstance(val, str):
@@ -346,5 +398,12 @@ class ExcelConnection:
         self.workbook.Save()
         recovery['status'] = 'saved-in-excel-cloud-not-confirmed'
         journal.write_text(json.dumps(recovery, ensure_ascii=False, indent=2), encoding='utf-8')
-        fresh = self._read()
+        self._writing = False
+        try:
+            fresh = self._read()
+        except CloudError:
+            raise
+        except Exception:
+            logging.warning('Saved, but the follow-up read failed', exc_info=True)
+            fresh = None  # The background refresh will catch up.
         return {'ok': True, 'data': fresh, 'cloudConfirmed': False}

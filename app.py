@@ -34,7 +34,7 @@ openpyxl = None
 _EXCEL_IMPORT_LOCK = threading.Lock()
 
 def load_excel_libraries():
-    global openpyxl, PatternFill, Font, Alignment, Border, Side, get_column_letter
+    global openpyxl, PatternFill, Font, Alignment, Border, Side, get_column_letter, Translator, TranslatorError
     if openpyxl is not None:
         return
     with _EXCEL_IMPORT_LOCK:
@@ -42,11 +42,12 @@ def load_excel_libraries():
             import openpyxl as module
             from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
             from openpyxl.utils import get_column_letter
+            from openpyxl.formula.translate import Translator, TranslatorError
             openpyxl = module
 
 
 APP_NAME = "ניהול משימות צוות"
-APP_VERSION = '1.1.0'
+APP_VERSION = '1.2.0'
 PORT = 8765
 TASK_SHEET = "משימות"
 LISTS_SHEET = "צוות ורשימות"
@@ -72,6 +73,9 @@ HEADERS = [
     "עודכן ע\"י",
     "זמן עדכון",
 ]
+TASK_FIELDS = ('title', 'owner', 'priority', 'status', 'category', 'dueDate', 'progress',
+               'blocked', 'notes', 'startDate', 'completedDate', 'id', 'daysLeft', 'health',
+               'dueMonth', 'createdBy', 'createdAt', 'updatedBy', 'updatedAt')
 HISTORY_HEADERS = ["זמן", "משתמש", "פעולה", "מספר משימה", "משימה", "פרטים"]
 START_ROW = 7
 MAX_ROW = 500
@@ -389,11 +393,8 @@ def get_configured_workbook_path() -> Path:
     return default_wb
 
 def set_configured_workbook_path(path: Path):
-    global _CLOUD
     write_config({'workbook': str(path.resolve()), 'mode': 'local'})
-    if _CLOUD is not None:
-        _CLOUD.stop()
-        _CLOUD = None
+    stop_cloud()
 
 @contextmanager
 def file_lock(lock_path: Path, timeout: float = 3.0):
@@ -515,6 +516,7 @@ def decode_workbook(wb, workbook_path, revision):
 
     # Read tasks
     tasks = []
+    task_rows = {}
     if TASK_SHEET in wb.sheetnames:
         ws_t = wb[TASK_SHEET]
         reserved_ids = {str(ws_t.cell(r, 12).value).strip()
@@ -566,6 +568,7 @@ def decode_workbook(wb, workbook_path, revision):
                 wb.close()
                 raise ValueError('קובץ האקסל מכיל מספרי משימה כפולים. תקן אותם באקסל לפני שמירה.')
             seen_ids.add(tid)
+            task_rows[tid] = r
 
             health, days_left = compute_health_and_days_left(status, blocked, due_date)
 
@@ -640,6 +643,7 @@ def decode_workbook(wb, workbook_path, revision):
         "statuses": statuses,
         "priorities": priorities,
         "tasks": tasks,
+        "taskRows": task_rows,
         "history": history,
     }
     return data
@@ -902,7 +906,17 @@ class TaskManagerWorkbook:
             r = 6 + i
             literal_cell(ws.cell(row=r, column=10), pr)
 
-    def _write_tasks_sheet(self, ws, tasks):
+    def _write_tasks_sheet(self, ws, tasks, previous=None, previous_rows=None):
+        previous = previous or {}
+        previous_rows = previous_rows or {}
+        # Capture whole rows by task ID before anything is overwritten.
+        last_column = max(ws.max_column, len(HEADERS))
+        snapshots = {
+            tid: [(c.value, c.data_type, copy.copy(c._style), c.coordinate)
+                  for c in (ws.cell(row, col) for col in range(1, last_column + 1))]
+            for tid, row in previous_rows.items()
+        }
+        occupied = set(previous_rows.values())
         self._apply_tasks_formatting(ws)
 
         fill_overdue = PatternFill(start_color="FFF1F2", end_color="FFF1F2", fill_type="solid")
@@ -923,6 +937,21 @@ class TaskManagerWorkbook:
         )
 
         max_row_to_clear = max(ws.max_row, len(tasks) + START_ROW - 1)
+
+        # Columns past S belong to the task on that row (T holds SharePoint history).
+        for row_idx in range(START_ROW, max_row_to_clear + 1):
+            index = row_idx - START_ROW
+            saved = snapshots.get(tasks[index].get('id')) if index < len(tasks) else None
+            for col_idx in range(len(HEADERS) + 1, last_column + 1):
+                cell = ws.cell(row_idx, col_idx)
+                if type(cell).__name__ == 'MergedCell':
+                    continue
+                carried = saved[col_idx - 1] if saved else None
+                if carried and carried[0] is not None:
+                    self._restore_cell(cell, carried)
+                elif row_idx in occupied:
+                    cell.value = None
+                    cell.style = 'Normal'
 
         for row_idx in range(START_ROW, max_row_to_clear + 1):
             task_idx = row_idx - START_ROW
@@ -1004,6 +1033,15 @@ class TaskManagerWorkbook:
                         else:
                             cell.alignment = Alignment(horizontal="right", vertical="center")
                         cell.font = Font(name="Arial", size=10)
+
+                # Keep a formula unless that field changed. Calculated columns M-O always keep it.
+                saved = snapshots.get(t.get('id'))
+                if saved:
+                    before = previous.get(t.get('id'), {})
+                    for col_idx, key in enumerate(TASK_FIELDS, 1):
+                        carried = saved[col_idx - 1]
+                        if carried[1] == 'f' and (col_idx in (13, 14, 15) or t.get(key) == before.get(key)):
+                            self._restore_cell(ws.cell(row_idx, col_idx), carried, keep_style=False)
             else:
                 # Clear empty row cells
                 for col_idx in range(1, len(HEADERS) + 1):
@@ -1011,6 +1049,21 @@ class TaskManagerWorkbook:
                     cell.value = None
                     cell.fill = PatternFill(fill_type=None)
                     cell.border = None
+
+    @staticmethod
+    def _restore_cell(cell, saved, keep_style=True):
+        """Write a captured cell, shifting relative formula references to its new row."""
+        value, data_type, style, origin = saved
+        if data_type == 'f' and isinstance(value, str) and origin != cell.coordinate:
+            try:
+                value = Translator(value, origin=origin).translate_formula(cell.coordinate)
+            except TranslatorError:
+                pass
+        cell.value = value
+        if data_type == 's':
+            cell.data_type = 's'  # Literal text that starts with "=" stays text.
+        if keep_style:
+            cell._style = copy.copy(style)
 
     def _write_history_sheet(self, ws, history_rows):
         self._apply_history_formatting(ws)
@@ -1060,6 +1113,7 @@ class TaskManagerWorkbook:
                 if self.loaded_revision and workbook_revision(self.path) != self.loaded_revision:
                     raise WorkbookConflictError('קובץ האקסל השתנה בזמן העריכה. רענן ובדוק את השינויים לפני שמירה.')
                 revision_before_save = workbook_revision(self.path)
+                before = self.read_all_data()
                 wb = openpyxl.load_workbook(str(self.path))
                 if TASK_SHEET not in wb.sheetnames:
                     wb.create_sheet(TASK_SHEET)
@@ -1085,7 +1139,9 @@ class TaskManagerWorkbook:
                     self._write_lists_sheet(ws_lists, people, categories, statuses, priorities)
 
                 # Write tasks
-                self._write_tasks_sheet(ws_tasks, tasks)
+                self._write_tasks_sheet(ws_tasks, tasks,
+                                        previous={t['id']: t for t in before['tasks']},
+                                        previous_rows=before['taskRows'])
 
                 # Append history entry if provided
                 if new_history_entry:
@@ -1141,6 +1197,7 @@ class TaskManagerWorkbook:
 
 
 _CLOUD = None
+_PENDING = None
 
 def read_config():
     if not CONFIG_FILE.exists():
@@ -1158,51 +1215,72 @@ def write_config(data):
     finally:
         temporary.unlink(missing_ok=True)
 
+def new_connection(url):
+    from cloud_excel import ExcelConnection
+
+    def activate(connection):
+        global _CLOUD, _PENDING
+        if connection is _CLOUD:
+            return  # Restored from saved settings; nothing to switch.
+        with THREAD_LOCK:
+            if connection is not _PENDING:
+                connection.stop()
+                return
+            try:
+                config = read_config()
+            except (ValueError, OSError):
+                config = {}
+            config.update(mode='excel', cloud_url=connection.url)
+            write_config(config)
+            previous, _CLOUD, _PENDING = _CLOUD, connection, None
+            if previous is not None:
+                previous.stop()
+
+    return ExcelConnection(url, decode_workbook,
+        {'task': TASK_SHEET, 'lists': LISTS_SHEET, 'history': HISTORY_SHEET, 'headers': HEADERS},
+        BASE_DIR / 'excel-recovery', activate)
+
 def start_cloud(url):
-    global _CLOUD
-    from cloud_excel import ExcelConnection, normalize_url
+    global _PENDING
+    from cloud_excel import normalize_url
     url = normalize_url(url)
     with THREAD_LOCK:
-        if _CLOUD is not None:
-            if _CLOUD.status()['state'] == 'connecting':
+        if _PENDING is not None:
+            if _PENDING.status()['state'] == 'connecting':
                 raise ValueError('Excel כבר מתחבר. השלם את הכניסה בחלון Excel והמתן.')
-            _CLOUD.stop()
-        def activate(connection):
-            with THREAD_LOCK:
-                if _CLOUD is not connection:
-                    connection.stop()
-                    return
-                try:
-                    config = read_config()
-                except (ValueError, OSError):
-                    config = {}
-                config.update(mode='excel', cloud_url=connection.url)
-                write_config(config)
-        _CLOUD = ExcelConnection(url, decode_workbook,
-            {'task': TASK_SHEET, 'lists': LISTS_SHEET, 'history': HISTORY_SHEET, 'headers': HEADERS},
-            BASE_DIR / 'excel-recovery', activate)
-    return _CLOUD
+            _PENDING.stop()
+        _PENDING = new_connection(url)
+        return _PENDING
+
+def stop_cloud():
+    global _CLOUD, _PENDING
+    for connection in (_CLOUD, _PENDING):
+        if connection is not None:
+            connection.stop()
+    _CLOUD = _PENDING = None
 
 def active_cloud():
-    config = read_config()
-    if config.get('mode') != 'excel':
-        return None
+    """The connection for the saved data source, or None in local mode."""
     global _CLOUD
     with THREAD_LOCK:
+        config = read_config()
+        if config.get('mode') != 'excel':
+            return None
         if _CLOUD is None:
-            start_cloud(config['cloud_url'])
-    if _CLOUD.url != config['cloud_url']:
-        from cloud_excel import CloudError
-        raise CloudError('מתבצעת החלפת חיבור. יש להמתין לסיום או לבחור קובץ מקומי.')
-    return _CLOUD
+            _CLOUD = new_connection(config['cloud_url'])
+        return _CLOUD
 
 def connection_status():
-    if _CLOUD is not None:
-        return _CLOUD.status()
+    pending = _PENDING
+    attempt = pending.status() if pending is not None else None
+    if attempt and attempt['state'] != 'error':
+        return {**attempt, 'state': 'connecting'}
     cloud = active_cloud()
-    if cloud is not None:
-        return cloud.status()
-    return {'mode': 'local', 'state': 'ready', 'message': 'קובץ מקומי • ללא אישור סנכרון ענן'}
+    status = cloud.status() if cloud is not None else {
+        'mode': 'local', 'state': 'ready', 'message': 'קובץ מקומי • ללא אישור סנכרון ענן'}
+    if attempt:
+        status['attempt'] = attempt
+    return status
 
 class CloudTaskWorkbook:
     def __init__(self, cloud, data, task_id, expected):
@@ -2160,8 +2238,7 @@ def run_server():
         log("Server stopped.")
     finally:
         server.server_close()
-        if _CLOUD is not None:
-            _CLOUD.stop()
+        stop_cloud()
 
 if __name__ == "__main__":
     main()
