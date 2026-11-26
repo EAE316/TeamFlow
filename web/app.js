@@ -3021,6 +3021,11 @@ document.addEventListener('DOMContentLoaded', async () => {
       setView(h);
     }
   });
+  // Show the running server's version, so the badge cannot fall behind a release.
+  api('/api/health').then(info => {
+    const badge = q('.brand-badge');
+    if (badge && info.version) badge.textContent = info.version.split('.').slice(0, 2).join('.');
+  }).catch(() => {});
   await load();
   const taskParam = urlParams.get('task');
   if (taskParam) {
