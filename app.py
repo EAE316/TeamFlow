@@ -47,7 +47,7 @@ def load_excel_libraries():
 
 
 APP_NAME = "ניהול משימות צוות"
-APP_VERSION = '1.2.0'
+APP_VERSION = '1.4.2'
 PORT = 8765
 TASK_SHEET = "משימות"
 LISTS_SHEET = "צוות ורשימות"
@@ -78,6 +78,8 @@ TASK_FIELDS = ('title', 'owner', 'priority', 'status', 'category', 'dueDate', 'p
                'dueMonth', 'createdBy', 'createdAt', 'updatedBy', 'updatedAt')
 HISTORY_HEADERS = ["זמן", "משתמש", "פעולה", "מספר משימה", "משימה", "פרטים"]
 START_ROW = 7
+# Column U: manual card order. Rows never move in SharePoint mode; only this number changes.
+ORDER_COLUMN = 21
 MAX_ROW = 500
 DEFAULT_PEOPLE = ["אלכס", "מאיה", "ירדן", "סם", "פריה"]
 DEFAULT_CATEGORIES = ["פיתוח", "בדיקות", "מוצר", "תפעול", "תיעוד", "תמיכה", "אבטחה", "שחרור גרסה"]
@@ -144,6 +146,19 @@ def get_logged_in_excel_user() -> str:
 
     return os.environ.get("USERNAME") or os.environ.get("USER") or "משתמש Excel"
 HEALTH_OVERDUE = "באיחור"
+# Opening a local file through desktop Excel runs the SharePoint code on this PC.
+EXCEL_TEST_MODE = '--excel-test' in sys.argv or os.environ.get('TEAMFLOW_EXCEL_TEST') == '1'
+
+
+def is_tombstone(value):
+    from cloud_excel import is_tombstone as check
+    return check(value)
+
+
+def task_events(value):
+    from cloud_excel import parse_events
+    return parse_events(value)
+
 HEALTH_DUE_SOON = "קרוב ליעד"
 HEALTH_ON_TRACK = "במסלול"
 
@@ -172,16 +187,27 @@ INSTANCE_ID = uuid.uuid4().hex
 class WorkbookConflictError(Exception):
     pass
 
-# OpenFileDialog is not a Form: TopMost belongs to its owner window.
+# The server is a background process, so Windows will not bring its windows to the front.
+# A visible, top-most, invisible owner keeps the dialog above the browser and gives it a
+# taskbar button. TopMost on an owner that is never shown has no effect.
 FILE_PICKER_SCRIPT = r"""
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
-Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 $owner = New-Object System.Windows.Forms.Form
 $dialog = New-Object System.Windows.Forms.OpenFileDialog
 try {
+    $area = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+    $owner.Text = 'TeamFlow - בחירת קובץ Excel'
+    $owner.FormBorderStyle = 'None'
+    $owner.StartPosition = 'Manual'
+    $owner.Size = New-Object System.Drawing.Size(1, 1)
+    $owner.Location = New-Object System.Drawing.Point(($area.X + $area.Width / 2), ($area.Y + $area.Height / 3))
+    $owner.Opacity = 0
     $owner.TopMost = $true
-    $owner.ShowInTaskbar = $false
+    $owner.ShowInTaskbar = $true
+    $owner.Show()
+    $owner.Activate()
     $dialog.Filter = 'Excel Files (*.xlsx)|*.xlsx'
     $dialog.Title = 'TeamFlow - Select Excel workbook'
     $dialog.CheckFileExists = $true
@@ -204,7 +230,7 @@ def pick_workbook():
     )
     if result.returncode:
         log(f'Windows file picker failed: {result.stderr}', logging.ERROR)
-        raise RuntimeError('לא ניתן לפתוח את סייר הקבצים. ניתן לבחור קובץ באמצעות נתיב מלא או העלאה.')
+        raise RuntimeError('לא ניתן לפתוח את סייר הקבצים. סגור חלונות פתוחים ונסה שוב.')
     return result.stdout.strip().lstrip('\ufeff')
 
 
@@ -517,6 +543,7 @@ def decode_workbook(wb, workbook_path, revision):
     # Read tasks
     tasks = []
     task_rows = {}
+    tombstone_rows = []
     if TASK_SHEET in wb.sheetnames:
         ws_t = wb[TASK_SHEET]
         reserved_ids = {str(ws_t.cell(r, 12).value).strip()
@@ -528,6 +555,9 @@ def decode_workbook(wb, workbook_path, revision):
             title = ws_t.cell(row=r, column=1).value
             task_id = ws_t.cell(row=r, column=12).value
             if title is None and task_id is None:
+                continue
+            if task_id and is_tombstone(ws_t.cell(row=r, column=20).value):
+                tombstone_rows.append(r)  # Deleted through SharePoint; its ID stays reserved.
                 continue
             if title is not None and not str(title).strip() and not task_id:
                 continue
@@ -576,6 +606,10 @@ def decode_workbook(wb, workbook_path, revision):
             created_at = format_date_str(ws_t.cell(row=r, column=17).value) or str(ws_t.cell(row=r, column=17).value or "").strip()
             updated_by = str(ws_t.cell(row=r, column=18).value or "").strip()
             updated_at = str(ws_t.cell(row=r, column=19).value or "").strip()
+            # Changes and comments stored with the task itself (column T).
+            activity = task_events(ws_t.cell(row=r, column=20).value)
+            order = ws_t.cell(row=r, column=ORDER_COLUMN).value
+            order = float(order) if isinstance(order, (int, float)) and not isinstance(order, bool) else None
 
             tasks.append({
                 "id": tid,
@@ -596,7 +630,11 @@ def decode_workbook(wb, workbook_path, revision):
                 "createdAt": created_at,
                 "updatedBy": updated_by,
                 "updatedAt": updated_at,
+                "activity": activity,
+                "order": order,
             })
+        # Manual order: the number in column U when set, otherwise the row itself.
+        tasks.sort(key=lambda t: t["order"] if t["order"] is not None else task_rows[t["id"]])
 
     # Read history (last 60, newest first)
     raw_history = []
@@ -634,9 +672,12 @@ def decode_workbook(wb, workbook_path, revision):
     history = list(reversed(raw_history[-60:]))
 
     wb.close()
+    lists_revision = hashlib.sha256(json.dumps([people, categories, statuses, priorities],
+                                               ensure_ascii=False).encode()).hexdigest()[:16]
     data = {
         "workbook": str(workbook_path),
         "revision": revision,
+        "listsRevision": lists_revision,
         "systemUser": get_logged_in_excel_user(),
         "people": people,
         "categories": categories,
@@ -644,9 +685,102 @@ def decode_workbook(wb, workbook_path, revision):
         "priorities": priorities,
         "tasks": tasks,
         "taskRows": task_rows,
+        "tombstoneRows": tombstone_rows,
         "history": history,
     }
     return data
+
+def build_report(data, start, end, today=None):
+    """The weekly report figures, shared by the screen and the Excel download."""
+    today = today or date.today().isoformat()
+    week_end = (date.fromisoformat(today) + timedelta(days=7)).isoformat()
+    tasks = data.get('tasks', [])
+    open_tasks = [t for t in tasks if t.get('status') not in (DONE, CANCELLED)]
+    in_range = lambda value: bool(value) and start <= str(value)[:10] <= end
+    completed = [t for t in tasks if t.get('status') == DONE and in_range(t.get('completedDate'))]
+    created = [t for t in tasks if in_range(t.get('createdAt'))]
+    overdue = sorted((t for t in open_tasks if t.get('health') == HEALTH_OVERDUE), key=lambda t: t.get('dueDate') or '')
+    upcoming = sorted((t for t in open_tasks if t.get('dueDate') and today < t['dueDate'] <= week_end),
+                      key=lambda t: t['dueDate'])
+    owners = list(dict.fromkeys(list(data.get('people', [])) + [t.get('owner') or '' for t in tasks]))
+    people = []
+    for owner in owners:
+        mine = [t for t in tasks if (t.get('owner') or '') == owner]
+        row = {'owner': owner or 'ללא שיוך',
+               'open': sum(t in open_tasks for t in mine),
+               'done': sum(t in completed for t in mine),
+               'overdue': sum(t in overdue for t in mine)}
+        if row['open'] or row['done']:
+            people.append(row)
+    return {'from': start, 'to': end, 'completed': completed, 'created': created,
+            'overdue': overdue, 'upcoming': upcoming, 'people': people, 'openCount': len(open_tasks)}
+
+
+def report_date(value):
+    """A yyyy-mm-dd text as a real date (shown dd/mm/yyyy), anything else unchanged."""
+    try:
+        return datetime.strptime(str(value)[:10], "%Y-%m-%d").date() if value else ''
+    except ValueError:
+        return value
+
+
+def display_date(value):
+    parsed = report_date(value)
+    return parsed.strftime("%d/%m/%Y") if isinstance(parsed, date) else str(value or '')
+
+
+def report_workbook_bytes(data, start, end):
+    """The report as an .xlsx file: a summary sheet and one sheet per list."""
+    load_excel_libraries()
+    report = build_report(data, start, end)
+    wb = openpyxl.Workbook()
+    header_fill = PatternFill(start_color="18181B", end_color="18181B", fill_type="solid")
+    header_font = Font(bold=True, color="FFFFFF")
+
+    def table(ws, first_row, headers, rows, widths):
+        for col, title in enumerate(headers, 1):
+            cell = ws.cell(first_row, col, title)
+            cell.fill, cell.font = header_fill, header_font
+        for r, values in enumerate(rows, first_row + 1):
+            for col, value in enumerate(values, 1):
+                cell = ws.cell(r, col)
+                literal_cell(cell, value)
+                if isinstance(value, date):
+                    cell.number_format = 'DD/MM/YYYY'
+
+        for col, width in enumerate(widths, 1):
+            ws.column_dimensions[get_column_letter(col)].width = width
+        ws.freeze_panes = ws.cell(first_row + 1, 1)
+
+    summary = wb.active
+    summary.title = 'סיכום'
+    summary.sheet_view.rightToLeft = True
+    summary['A1'] = f'דוח TeamFlow {display_date(start)} עד {display_date(end)}'
+    summary['A1'].font = Font(bold=True, size=14)
+    figures = [('הושלמו בתקופה', len(report['completed'])), ('נוצרו בתקופה', len(report['created'])),
+               ('פתוחות כעת', report['openCount']), ('באיחור כעת', len(report['overdue'])),
+               ('יעד בשבוע הקרוב', len(report['upcoming']))]
+    for r, (label, value) in enumerate(figures, 3):
+        summary.cell(r, 1, label)
+        summary.cell(r, 2, value).font = Font(bold=True)
+    table(summary, 10, ['אחראי', 'פתוחות', 'הושלמו בתקופה', 'באיחור'],
+          [[p['owner'], p['open'], p['done'], p['overdue']] for p in report['people']], [24, 12, 16, 12])
+    summary.freeze_panes = None
+
+    task_columns = ['מספר', 'משימה', 'אחראי', 'עדיפות', 'סטטוס', 'תאריך יעד', 'תאריך סיום']
+    for title, rows in (('הושלמו', report['completed']), ('באיחור', report['overdue']),
+                        ('יעד בשבוע הקרוב', report['upcoming']), ('נוצרו', report['created'])):
+        ws = wb.create_sheet(title)
+        ws.sheet_view.rightToLeft = True
+        table(ws, 1, task_columns,
+              [[t.get('id', ''), t.get('title', ''), t.get('owner', ''), t.get('priority', ''),
+                t.get('status', ''), report_date(t.get('dueDate')), report_date(t.get('completedDate'))] for t in rows],
+              [10, 44, 18, 10, 14, 13, 13])
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    wb.close()
+    return buffer.getvalue()
+
 
 class TaskManagerWorkbook:
     """Manages the Excel workbook operations."""
@@ -656,6 +790,11 @@ class TaskManagerWorkbook:
         self.path = path.resolve()
         self.lock_path = self.path.parent / f"{self.path.name}.lock"
         self.loaded_revision = None
+
+    @staticmethod
+    def new_task_id(tasks):
+        numbers = [int(t['id'][2:]) for t in tasks if t.get('id', '').startswith('T-') and t['id'][2:].isdigit()]
+        return f"T-{max(numbers, default=0) + 1:03d}"
 
     def ensure_workbook_exists(self):
         with THREAD_LOCK:
@@ -906,7 +1045,7 @@ class TaskManagerWorkbook:
             r = 6 + i
             literal_cell(ws.cell(row=r, column=10), pr)
 
-    def _write_tasks_sheet(self, ws, tasks, previous=None, previous_rows=None):
+    def _write_tasks_sheet(self, ws, tasks, previous=None, previous_rows=None, tombstone_rows=()):
         previous = previous or {}
         previous_rows = previous_rows or {}
         # Capture whole rows by task ID before anything is overwritten.
@@ -916,7 +1055,7 @@ class TaskManagerWorkbook:
                   for c in (ws.cell(row, col) for col in range(1, last_column + 1))]
             for tid, row in previous_rows.items()
         }
-        occupied = set(previous_rows.values())
+        occupied = set(previous_rows.values()) | set(tombstone_rows)
         self._apply_tasks_formatting(ws)
 
         fill_overdue = PatternFill(start_color="FFF1F2", end_color="FFF1F2", fill_type="solid")
@@ -952,6 +1091,11 @@ class TaskManagerWorkbook:
                 elif row_idx in occupied:
                     cell.value = None
                     cell.style = 'Normal'
+
+        if any(t.get('order') is not None for t in tasks):
+            ws.cell(6, ORDER_COLUMN).value = 'סדר'
+            for index, t in enumerate(tasks):
+                ws.cell(START_ROW + index, ORDER_COLUMN).value = index + 1
 
         for row_idx in range(START_ROW, max_row_to_clear + 1):
             task_idx = row_idx - START_ROW
@@ -1141,7 +1285,8 @@ class TaskManagerWorkbook:
                 # Write tasks
                 self._write_tasks_sheet(ws_tasks, tasks,
                                         previous={t['id']: t for t in before['tasks']},
-                                        previous_rows=before['taskRows'])
+                                        previous_rows=before['taskRows'],
+                                        tombstone_rows=before['tombstoneRows'])
 
                 # Append history entry if provided
                 if new_history_entry:
@@ -1167,34 +1312,48 @@ class TaskManagerWorkbook:
                         else:
                             cell.alignment = Alignment(horizontal="right", vertical="center")
 
-                # Save workbook atomically to prevent file corruption
-                tmp_path = self.path.parent / f".tmp_{os.getpid()}_{time.time_ns()}.xlsx"
-                try:
-                    wb.save(str(tmp_path))
-                    wb.close()
-                    if workbook_revision(self.path) != revision_before_save:
-                        raise WorkbookConflictError('קובץ האקסל השתנה בזמן השמירה. השינוי החיצוני נשמר; רענן ונסה שוב.')
-                    os.replace(str(tmp_path), str(self.path))
-                    self.loaded_revision = workbook_revision(self.path)
-                    DATA_CACHE.clear()
-                    log(f"Workbook saved atomically at {self.path}")
-                except PermissionError:
-                    if tmp_path.exists():
-                        try:
-                            tmp_path.unlink()
-                        except OSError:
-                            pass
-                    raise PermissionError("אי אפשר לשמור. סגור את קובץ האקסל ונסה שוב.")
-                except Exception as e:
-                    if tmp_path.exists():
-                        try:
-                            tmp_path.unlink()
-                        except OSError:
-                            pass
-                    raise e
-                finally:
-                    wb.close()
+                self._replace_file(wb, revision_before_save)
 
+    def _replace_file(self, wb, revision_before_save):
+        """Save atomically, refusing if the file changed underneath us."""
+        tmp_path = self.path.parent / f".tmp_{os.getpid()}_{time.time_ns()}.xlsx"
+        try:
+            wb.save(str(tmp_path))
+            wb.close()
+            if workbook_revision(self.path) != revision_before_save:
+                raise WorkbookConflictError('קובץ האקסל השתנה בזמן השמירה. השינוי החיצוני נשמר; רענן ונסה שוב.')
+            os.replace(str(tmp_path), str(self.path))
+            self.loaded_revision = workbook_revision(self.path)
+            DATA_CACHE.clear()
+            log(f"Workbook saved atomically at {self.path}")
+        except PermissionError:
+            tmp_path.unlink(missing_ok=True)
+            raise PermissionError("אי אפשר לשמור. סגור את קובץ האקסל ונסה שוב.")
+        except Exception:
+            tmp_path.unlink(missing_ok=True)
+            raise
+        finally:
+            wb.close()
+
+    def add_task_event(self, task_id, event):
+        """Append to one task's history cell (column T) without rewriting the sheet."""
+        from cloud_excel import append_event
+        with THREAD_LOCK:
+            self.ensure_workbook_exists()
+            with file_lock(self.lock_path):
+                revision_before_save = workbook_revision(self.path)
+                current = self.read_all_data()
+                if not any(t['id'] == task_id for t in current['tasks']):
+                    raise ValueError('המשימה אינה קיימת עוד. רענן את הנתונים.')
+                wb = openpyxl.load_workbook(str(self.path))
+                try:
+                    cell = wb[TASK_SHEET].cell(current['taskRows'][task_id], 20)
+                    literal_cell(cell, append_event(cell.value, dict(event, id=task_id)))
+                    cell.alignment = Alignment(wrap_text=False, vertical="center")
+                except Exception:
+                    wb.close()
+                    raise
+                self._replace_file(wb, revision_before_save)
 
 _CLOUD = None
 _PENDING = None
@@ -1215,7 +1374,7 @@ def write_config(data):
     finally:
         temporary.unlink(missing_ok=True)
 
-def new_connection(url):
+def new_connection(url, local_test=False):
     from cloud_excel import ExcelConnection
 
     def activate(connection):
@@ -1230,7 +1389,9 @@ def new_connection(url):
                 config = read_config()
             except (ValueError, OSError):
                 config = {}
-            config.update(mode='excel', cloud_url=connection.url)
+            config.update(mode='excel', cloud_url=connection.url, excelTest=connection.local_test)
+            if connection.local_test:
+                config['workbook'] = connection.url
             write_config(config)
             previous, _CLOUD, _PENDING = _CLOUD, connection, None
             if previous is not None:
@@ -1238,26 +1399,32 @@ def new_connection(url):
 
     return ExcelConnection(url, decode_workbook,
         {'task': TASK_SHEET, 'lists': LISTS_SHEET, 'history': HISTORY_SHEET, 'headers': HEADERS},
-        BASE_DIR / 'excel-recovery', activate)
+        BASE_DIR / 'excel-recovery', activate, local_test=local_test)
 
-def start_cloud(url):
+def start_cloud(url, local_test=False):
     global _PENDING
     from cloud_excel import normalize_url
-    url = normalize_url(url)
+    url = str(Path(url).resolve()) if local_test else normalize_url(url)
     with THREAD_LOCK:
         if _PENDING is not None:
             if _PENDING.status()['state'] == 'connecting':
                 raise ValueError('Excel כבר מתחבר. השלם את הכניסה בחלון Excel והמתן.')
             _PENDING.stop()
-        _PENDING = new_connection(url)
+        _PENDING = new_connection(url, local_test)
         return _PENDING
 
-def stop_cloud():
+def stop_cloud(wait=False):
+    """Stop Excel connections. On exit, wait for test-mode Excel, which is hidden, to close itself."""
     global _CLOUD, _PENDING
-    for connection in (_CLOUD, _PENDING):
-        if connection is not None:
-            connection.stop()
+    connections = [c for c in (_CLOUD, _PENDING) if c is not None]
+    for connection in connections:
+        connection.stop()
     _CLOUD = _PENDING = None
+    if wait:
+        for connection in connections:
+            thread = getattr(connection, '_thread', None)
+            if getattr(connection, 'local_test', False) and thread is not None:
+                thread.join(15)
 
 def active_cloud():
     """The connection for the saved data source, or None in local mode."""
@@ -1266,8 +1433,10 @@ def active_cloud():
         config = read_config()
         if config.get('mode') != 'excel':
             return None
+        if config.get('excelTest') and not EXCEL_TEST_MODE:
+            return None  # A test connection reopens as the plain local file.
         if _CLOUD is None:
-            _CLOUD = new_connection(config['cloud_url'])
+            _CLOUD = new_connection(config['cloud_url'], bool(config.get('excelTest')))
         return _CLOUD
 
 def connection_status():
@@ -1283,23 +1452,70 @@ def connection_status():
     return status
 
 class CloudTaskWorkbook:
-    def __init__(self, cloud, data, task_id, expected):
+    """Turns a handler's full task list back into one Excel operation."""
+
+    def __init__(self, cloud, data, task_id=None, expected=None, lists_revision=None):
         self.cloud, self.data, self.task_id, self.expected = cloud, copy.deepcopy(data), task_id, expected
+        self.lists_revision = lists_revision
+        self.written = False
 
     def read_all_data(self):
-        return copy.deepcopy(self.data)
+        # After a write, hand back what Excel now holds rather than the snapshot we started from.
+        return self.cloud.snapshot() if self.written else copy.deepcopy(self.data)
+
+    def new_task_id(self, tasks):
+        return self.cloud.new_task_id()
 
     def save_all_data(self, tasks, lists=None, new_history_entry=None):
         from cloud_excel import CloudConflict, CLOUD_LIMIT
-        old_ids = [t['id'] for t in self.data['tasks']]
-        if lists is not None or [t['id'] for t in tasks] != old_ids:
-            raise CloudConflict(CLOUD_LIMIT)
-        previous = {t['id']: t for t in self.data['tasks']}
-        for task in tasks:
-            if task['id'] != self.task_id and task != previous[task['id']]:
+        if lists is not None:
+            if [t['id'] for t in tasks] != [t['id'] for t in self.data['tasks']]:
                 raise CloudConflict(CLOUD_LIMIT)
-        task = next(t for t in tasks if t['id'] == self.task_id)
-        self.cloud.submit('update', task, self.expected, new_history_entry)
+            self.cloud.submit('lists', lists, self.lists_revision)
+            self.written = True
+            return
+        old = {t['id']: t for t in self.data['tasks']}
+        new = {t['id']: t for t in tasks}
+        added = [i for i in new if i not in old]
+        removed = [i for i in old if i not in new]
+        changed = [i for i in new if i in old and new[i] != old[i]]
+        same_order = [t['id'] for t in tasks if t['id'] in old] == [i for i in old if i in new]
+        if not same_order:
+            raise CloudConflict(CLOUD_LIMIT)
+        self.written = True
+        if self.task_id is None and len(added) == 1 and not removed and not changed:
+            self.cloud.submit('create', new[added[0]], new_history_entry)
+        elif self.task_id is not None and removed == [self.task_id] and not added and not changed:
+            self.cloud.submit('delete', self.task_id, self.expected, new_history_entry)
+        elif self.task_id is not None and not added and not removed and changed in ([], [self.task_id]):
+            if changed:
+                self.cloud.submit('update', new[self.task_id], self.expected, new_history_entry)
+        else:
+            raise CloudConflict(CLOUD_LIMIT)
+
+
+def apply_bulk_action(t, action, val, user, now_str, today_str):
+    """One bulk change applied to one task; shared by local and SharePoint mode."""
+    t["updatedBy"] = user
+    t["updatedAt"] = now_str
+    if action == "done" or (action == "status" and val == DONE):
+        t.update(status=DONE, progress=100, completedDate=today_str, blocked=NO,
+                 health=HEALTH_CLOSED, daysLeft=DONE)
+    elif action == "status":
+        t["status"] = val
+        t["completedDate"] = ''
+        t["health"], t["daysLeft"] = compute_health_and_days_left(t["status"], t["blocked"], t.get("dueDate", ""))
+    elif action == "owner":
+        t["owner"] = val
+    elif action == "priority":
+        t["priority"] = val
+    elif action == "blocked":
+        t["blocked"] = val if val else YES
+        t["health"], t["daysLeft"] = compute_health_and_days_left(t["status"], t["blocked"], t.get("dueDate", ""))
+    return t
+
+
+BULK_ACTIONS = ("done", "status", "owner", "priority", "blocked", "delete")
 
 
 class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
@@ -1396,6 +1612,9 @@ class TaskRequestHandler(BaseHTTPRequestHandler):
             except Exception as e:
                 self.send_json({'ok': False, 'error': str(e)}, 500)
             return
+        elif path == "/api/report.xlsx":
+            self.handle_report_download(urllib.parse.parse_qs(parsed.query))
+            return
         elif path == "/" or not path.startswith("/api/"):
             LAST_PING_TIME = time.time()
             HAS_CONNECTED = True
@@ -1446,24 +1665,14 @@ class TaskRequestHandler(BaseHTTPRequestHandler):
             if path == '/api/browse-workbook':
                 self.handle_browse_workbook()
                 return
+            mutations = ('/api/task', '/api/delete', '/api/done', '/api/bulk', '/api/reorder', '/api/lists', '/api/comment')
+            cloud = active_cloud() if path in mutations else None
+            if cloud is not None:
+                self.handle_cloud_mutation(cloud, path, body)
+                return
             # Serialize the complete read-modify-write transaction, across processes too.
             with THREAD_LOCK:
-                mutations = ('/api/task', '/api/delete', '/api/done', '/api/bulk', '/api/reorder', '/api/lists')
                 if path in mutations:
-                    cloud = active_cloud()
-                    if cloud is not None:
-                        from cloud_excel import CloudConflict, CLOUD_LIMIT
-                        if path not in ('/api/task', '/api/done') or not body.get('id'):
-                            raise CloudConflict(CLOUD_LIMIT)
-                        data = cloud.snapshot()
-                        if body.get('workbook') != data['workbook']:
-                            raise CloudConflict('מקור הנתונים הוחלף. יש לפתוח מחדש את המשימה.')
-                        current = next((t for t in data['tasks'] if t['id'] == body['id']), None)
-                        if not current or not body.get('taskRevision') or body['taskRevision'] != current['taskRevision']:
-                            raise CloudConflict('המשימה השתנתה. הטיוטה נשארה בטופס; יש להשוות עם הגרסה העדכנית.')
-                        manager = CloudTaskWorkbook(cloud, data, body['id'], body['taskRevision'])
-                        self.dispatch_post(path, manager, body)
-                        return
                     wb_mgr = TaskManagerWorkbook(get_configured_workbook_path())
                     with file_lock(wb_mgr.lock_path):
                         if body.get('workbook') and Path(body['workbook']).resolve() != wb_mgr.path:
@@ -1488,6 +1697,86 @@ class TaskRequestHandler(BaseHTTPRequestHandler):
             log(f"API Error ({path}): {e}", logging.ERROR)
             self.send_json({"ok": False, "error": str(e)}, status=500)
 
+    def handle_cloud_mutation(self, cloud, path, body):
+        from cloud_excel import CloudConflict, CLOUD_LIMIT
+        data = cloud.snapshot()
+        if body.get('workbook') != data['workbook']:
+            raise CloudConflict('מקור הנתונים הוחלף. יש לפתוח מחדש את המשימה.')
+        if path == '/api/bulk':
+            self.handle_cloud_bulk(cloud, body)
+            return
+        if path == '/api/comment':
+            event = self.comment_event(body)
+            if event:
+                cloud.submit('comment', body.get('id', ''), event)
+                self.send_json({'ok': True})
+            return
+        if path == '/api/reorder':
+            ids = body.get('ids') or []
+            if not ids:
+                self.send_json({'ok': False, 'error': 'חסר סדר משימות'}, 400)
+                return
+            cloud.submit('reorder', ids)
+            self.send_json({'ok': True})
+            return
+        if path == '/api/lists':
+            self.handle_save_lists(CloudTaskWorkbook(cloud, data, lists_revision=body.get('listsRevision')), body)
+            return
+        if path == '/api/task' and not body.get('id'):
+            self.dispatch_post(path, CloudTaskWorkbook(cloud, data), body)
+            return
+        current = next((t for t in data['tasks'] if t['id'] == body.get('id')), None)
+        if not current or not body.get('taskRevision') or body['taskRevision'] != current['taskRevision']:
+            raise CloudConflict('המשימה השתנתה. הטיוטה נשארה בטופס; יש להשוות עם הגרסה העדכנית.')
+        self.dispatch_post(path, CloudTaskWorkbook(cloud, data, body['id'], body['taskRevision']), body)
+
+    def comment_event(self, body):
+        """The history event for a comment, or None after sending a 400."""
+        text = (body.get('text') or '').strip()
+        if not body.get('id') or not text:
+            self.send_json({'ok': False, 'error': 'חסר טקסט לתגובה'}, 400)
+            return None
+        if len(text) > 2000:
+            self.send_json({'ok': False, 'error': 'התגובה ארוכה מדי (עד 2000 תווים).'}, 400)
+            return None
+        user = (body.get('user') or '').strip() or get_logged_in_excel_user()
+        return {'action': 'תגובה', 'user': user, 'comment': text}
+
+    def handle_cloud_bulk(self, cloud, body):
+        """Bulk changes as one Excel operation per task, each checked against the latest data."""
+        from cloud_excel import CloudConflict
+        ids = list(dict.fromkeys(body.get("ids") or []))
+        action = (body.get("action") or "").strip()
+        value = (body.get("value") or "").strip()
+        user = (body.get("user") or "").strip() or get_logged_in_excel_user()
+        if not ids:
+            self.send_json({"ok": False, "error": "לא נבחרו משימות"}, status=400)
+            return
+        if action not in BULK_ACTIONS:
+            self.send_json({"ok": False, "error": "פעולה לא מוכרת"}, status=400)
+            return
+        now = datetime.now()
+        done, failed = 0, []
+        for task_id in ids:
+            task = next((t for t in cloud.snapshot()['tasks'] if t['id'] == task_id), None)
+            if task is None:
+                failed.append(task_id)
+                continue
+            history = {"user": user, "action": "מחיקת משימה" if action == "delete" else "פעולה מרובה",
+                       "id": task_id, "title": task.get("title", ""),
+                       "details": f"{action}: '{value}' ע\"י {user}"}
+            try:
+                if action == "delete":
+                    cloud.submit('delete', task_id, task['taskRevision'], history)
+                else:
+                    changed = apply_bulk_action(copy.deepcopy(task), action, value, user,
+                                                now.strftime("%Y-%m-%d %H:%M:%S"), now.strftime("%Y-%m-%d"))
+                    cloud.submit('update', changed, task['taskRevision'], history)
+                done += 1
+            except CloudConflict:
+                failed.append(task_id)
+        self.send_json({"ok": True, "count": done, "failed": failed})
+
     def dispatch_post(self, path, wb_mgr, body):
         if path == "/api/task":
             self.handle_save_task(wb_mgr, body)
@@ -1501,6 +1790,11 @@ class TaskRequestHandler(BaseHTTPRequestHandler):
             self.handle_reorder(wb_mgr, body)
         elif path == "/api/lists":
             self.handle_save_lists(wb_mgr, body)
+        elif path == "/api/comment":
+            event = self.comment_event(body)
+            if event:
+                wb_mgr.add_task_event(body.get('id', ''), event)
+                self.send_json({'ok': True})
         elif path == "/api/set-workbook":
             self.handle_set_workbook(body)
         elif path == "/api/upload-workbook":
@@ -1511,6 +1805,29 @@ class TaskRequestHandler(BaseHTTPRequestHandler):
             self.handle_open_excel()
         else:
             self.send_json({"ok": False, "error": "נתיב לא מוכר"}, status=404)
+
+    def handle_report_download(self, query):
+        try:
+            start, end = (query.get(k, [''])[0] for k in ('from', 'to'))
+            if date.fromisoformat(start) > date.fromisoformat(end):
+                raise ValueError('טווח התאריכים אינו תקין')
+            cloud = active_cloud()
+            data = cloud.snapshot() if cloud is not None else TaskManagerWorkbook(get_configured_workbook_path()).read_all_data()
+            content = report_workbook_bytes(data, start, end)
+        except ValueError as exc:
+            self.send_json({'ok': False, 'error': str(exc) or 'טווח התאריכים אינו תקין'}, 400)
+            return
+        except Exception as exc:
+            log(f'Report failed: {exc}', logging.ERROR)
+            self.send_json({'ok': False, 'error': str(exc)}, 500)
+            return
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+        self.send_header('Content-Disposition', f'attachment; filename="TeamFlow-report-{end}.xlsx"')
+        self.send_header('Content-Length', str(len(content)))
+        self.send_header('Cache-Control', 'no-store')
+        self.end_headers()
+        self.wfile.write(content)
 
     def handle_open_excel(self):
         cloud = active_cloud()
@@ -1536,7 +1853,7 @@ class TaskRequestHandler(BaseHTTPRequestHandler):
                 raise ValueError('Expected a JSON object')
             for key in ('id', 'title', 'owner', 'priority', 'status', 'category', 'dueDate',
                         'startDate', 'completedDate', 'blocked', 'notes', 'user', 'action',
-                        'value', 'workbook', 'revision', 'path', 'filename', 'content'):
+                        'value', 'workbook', 'revision', 'path', 'filename', 'content', 'text'):
                 if key in data and not isinstance(data[key], str):
                     raise ValueError('Expected text for ' + key)
             if 'ids' in data and (not isinstance(data['ids'], list) or
@@ -1680,6 +1997,11 @@ class TaskRequestHandler(BaseHTTPRequestHandler):
             }, status=400)
             return
 
+        if EXCEL_TEST_MODE:
+            validate_workbook(target_path)
+            connection = start_cloud(str(target_path), local_test=True)
+            self.send_json({'ok': True, **connection.status()}, 202)
+            return
         self.activate_workbook(target_path)
 
     def activate_workbook(self, target_path):
@@ -1783,15 +2105,7 @@ class TaskRequestHandler(BaseHTTPRequestHandler):
         is_new = False
         if not task_id:
             is_new = True
-            max_num = 0
-            for t in tasks:
-                tid = t.get("id", "")
-                if tid.startswith("T-"):
-                    try:
-                        max_num = max(max_num, int(tid[2:]))
-                    except ValueError:
-                        pass
-            task_id = f"T-{max_num + 1:03d}"
+            task_id = wb_mgr.new_task_id(tasks)
         else:
             if not any(t.get("id") == task_id for t in tasks):
                 self.send_json({'ok': False, 'error': 'המשימה אינה קיימת עוד. רענן את הנתונים.'}, 404)
@@ -1991,7 +2305,7 @@ class TaskRequestHandler(BaseHTTPRequestHandler):
         user = (body.get("user") or "").strip() or get_logged_in_excel_user()
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        if action not in ["done", "status", "owner", "priority", "blocked", "delete"]:
+        if action not in BULK_ACTIONS:
             self.send_json({"ok": False, "error": "פעולה לא מוכרת"}, status=400)
             return
 
@@ -2020,37 +2334,7 @@ class TaskRequestHandler(BaseHTTPRequestHandler):
         for t in tasks:
             if t.get("id") in id_set:
                 affected_count += 1
-                t["updatedBy"] = user
-                t["updatedAt"] = now_str
-                if action == "done":
-                    t["status"] = DONE
-                    t["progress"] = 100
-                    t["completedDate"] = today_str
-                    t["blocked"] = NO
-                    t["health"] = HEALTH_CLOSED
-                    t["daysLeft"] = DONE
-                elif action == "status":
-                    t["status"] = val
-                    if val == DONE:
-                        t["progress"] = 100
-                        t["completedDate"] = today_str
-                        t["blocked"] = NO
-                        t["health"] = HEALTH_CLOSED
-                        t["daysLeft"] = DONE
-                    else:
-                        t['completedDate'] = ''
-                        h, dl = compute_health_and_days_left(t["status"], t["blocked"], t.get("dueDate", ""))
-                        t["health"] = h
-                        t["daysLeft"] = dl
-                elif action == "owner":
-                    t["owner"] = val
-                elif action == "priority":
-                    t["priority"] = val
-                elif action == "blocked":
-                    t["blocked"] = val if val else YES
-                    h, dl = compute_health_and_days_left(t["status"], t["blocked"], t.get("dueDate", ""))
-                    t["health"] = h
-                    t["daysLeft"] = dl
+                apply_bulk_action(t, action, val, user, now_str, today_str)
 
         wb_mgr.save_all_data(
             tasks,
@@ -2238,7 +2522,7 @@ def run_server():
         log("Server stopped.")
     finally:
         server.server_close()
-        stop_cloud()
+        stop_cloud(wait=True)
 
 if __name__ == "__main__":
     main()

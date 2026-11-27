@@ -4,8 +4,10 @@ Windows desktop task manager with a Hebrew interface and Excel workbook storage.
 
 ## Download
 Get the installer EXE from [Releases](../../releases).
-Version 1.2.0 is a **preview**: its SharePoint fixes have only been tested with a simulated
-Excel, not real SharePoint. The previous 1.1.0 preview stays available on the same page.
+Version 1.4.2 is a **preview** with a new modern interface (light and dark themes), dates
+shown as dd/mm/yyyy, and full task editing in SharePoint mode. Its SharePoint code was tested
+with desktop Excel on local copies, not with real SharePoint or two PCs editing at once.
+Earlier previews stay available on the same page.
 The installer is unsigned and Windows may display an unknown-publisher warning.
 
 ## SharePoint preview
@@ -13,11 +15,12 @@ Connect through the installed Microsoft 365 desktop Excel application using a fu
 SharePoint .xlsx document URL. Excel handles Office sign-in and coauthoring.
 No TeamFlow Entra registration or OneDrive shortcut is required by this design.
 
-The preview supports **editing existing tasks only** in cloud mode. Creation,
-deletion, bulk operations, row reordering, and list editing are disabled there.
-Local-file mode retains those features. Same-task simultaneous edits are not
-protected by a distributed lock. AutoSave enabled is not cloud delivery confirmation.
-Start with a disposable workbook copy. See [release notes](RELEASE_NOTES.md).
+Everything is done in the app, also in SharePoint mode: creating, editing and deleting
+tasks, bulk actions, manual card order, comments and the team lists. Writes are cell-level,
+rows never move, and new tasks get random IDs so two PCs cannot clash. Two people editing
+the *same task* within seconds of each other is not locked: the last save wins. AutoSave
+enabled is not cloud delivery confirmation. Start with a disposable workbook copy.
+See [release notes](RELEASE_NOTES.md).
 
 ## Build
 Windows, Python 3.12, and Inno Setup 6 are required.
@@ -27,5 +30,5 @@ Windows, Python 3.12, and Inno Setup 6 are required.
 
 This source distribution does not include private workbooks, local configuration,
 certificates, logs, backups, or the previous private test fixtures. Use -SkipTests.
-Local-file tests were run before release from the private fixtures. No real SharePoint
-tests were run for 1.2.0.
+Tests were run before release from the private fixtures, including tests that drive real
+desktop Excel on local copies. No real SharePoint tests were run for 1.4.2.
